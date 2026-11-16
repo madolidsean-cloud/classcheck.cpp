@@ -1,272 +1,327 @@
-#define UNICODE
-#define _UNICODE
-#include <windows.h>
-#include <algorithm>
-#include <fstream>
-#include <string>
-#include <vector>
+#include <QApplication>
+#include <QComboBox>
+#include <QCryptographicHash>
+#include <QDate>
+#include <QDateEdit>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFile>
+#include <QFileDialog>
+#include <QFormLayout>
+#include <QHeaderView>
+#include <QInputDialog>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QSqlDatabase>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QStandardPaths>
+#include <QTableWidget>
+#include <QTableWidgetItem>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QDir>
+#include <QByteArray>
+#include <QVariant>
 
 namespace {
 
-constexpr int ID_NAME_EDIT = 101;
-constexpr int ID_ADD_BUTTON = 102;
-constexpr int ID_LIST = 103;
-constexpr int ID_PRESENT_BUTTON = 104;
-constexpr int ID_ABSENT_BUTTON = 105;
-constexpr int ID_SAVE_BUTTON = 106;
-constexpr int ID_STATUS = 107;
+const QStringList statuses{QStringLiteral("Unmarked"), QStringLiteral("Present"),
+                           QStringLiteral("Absent"), QStringLiteral("Late"),
+                           QStringLiteral("Excused")};
 
-const wchar_t* WINDOW_CLASS = L"SimpleAttendanceCheckerWindow";
-const char* DATA_FILE = "attendance.csv";
-
-struct Student {
-    std::wstring name;
-    bool present = false;
-};
-
-std::vector<Student> students;
-HWND nameEdit = nullptr;
-HWND studentList = nullptr;
-HWND statusLabel = nullptr;
-HWND mainWindow = nullptr;
-
-std::string toUtf8(const std::wstring& text) {
-    if (text.empty()) return std::string();
-    const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (size <= 1) return std::string();
-    std::string result(static_cast<std::size_t>(size - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, &result[0], size, nullptr, nullptr);
-    return result;
+QString hashPassword(const QString &password, const QByteArray &salt) {
+    QByteArray hash = salt + password.toUtf8();
+    // Iterated salted hash for a lightweight local demo, not a substitute for
+    // a production password-hashing scheme such as Argon2id or bcrypt.
+    for (int i = 0; i < 150000; ++i)
+        hash = QCryptographicHash::hash(hash, QCryptographicHash::Sha256);
+    return QString::fromLatin1(hash.toHex());
 }
 
-std::wstring fromUtf8(const std::string& text) {
-    if (text.empty()) return std::wstring();
-    const int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
-    if (size <= 1) return std::wstring();
-    std::wstring result(static_cast<std::size_t>(size - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, &result[0], size);
-    return result;
+bool runQuery(QSqlQuery &query, const QString &context) {
+    if (query.exec()) return true;
+    QMessageBox::critical(nullptr, QStringLiteral("Database error"),
+                          context + QStringLiteral("\n\n") + query.lastError().text());
+    return false;
 }
 
-void updateStatus() {
-    int presentCount = 0;
-    for (const Student& student : students) {
-        if (student.present) ++presentCount;
+bool openDatabase() {
+    QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (dataDir.isEmpty() || !QDir().mkpath(dataDir)) {
+        QMessageBox::critical(nullptr, QStringLiteral("Startup error"),
+                              QStringLiteral("Could not create the application data folder."));
+        return false;
     }
-
-    const std::wstring message = L"Students: " + std::to_wstring(students.size()) +
-        L"    Present: " + std::to_wstring(presentCount) +
-        L"    Absent: " + std::to_wstring(students.size() - presentCount);
-    SetWindowTextW(statusLabel, message.c_str());
-}
-
-void refreshList(int selectedIndex = -1) {
-    SendMessageW(studentList, LB_RESETCONTENT, 0, 0);
-    for (const Student& student : students) {
-        const std::wstring row = student.name + (student.present ? L" - Present" : L" - Absent");
-        SendMessageW(studentList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row.c_str()));
+    const QString path = dataDir + QStringLiteral("/attendance.sqlite");
+    QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"));
+    db.setDatabaseName(path);
+    if (!db.open()) {
+        QMessageBox::critical(nullptr, QStringLiteral("Database error"), db.lastError().text());
+        return false;
     }
-    if (selectedIndex >= 0 && selectedIndex < static_cast<int>(students.size())) {
-        SendMessageW(studentList, LB_SETCURSEL, selectedIndex, 0);
+    QSqlQuery query;
+    if (!runQuery(query, QStringLiteral("Could not initialize the database."))) return false;
+    query.prepare(QStringLiteral("CREATE TABLE IF NOT EXISTS students ("
+                                 "id TEXT PRIMARY KEY, name TEXT NOT NULL)"));
+    if (!runQuery(query, QStringLiteral("Could not create the student table."))) return false;
+    query.prepare(QStringLiteral("CREATE TABLE IF NOT EXISTS attendance ("
+                                 "student_id TEXT NOT NULL, date TEXT NOT NULL, status TEXT NOT NULL, "
+                                 "PRIMARY KEY(student_id, date), "
+                                 "FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE)"));
+    if (!runQuery(query, QStringLiteral("Could not create the attendance table."))) return false;
+    query.prepare(QStringLiteral("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"));
+    return runQuery(query, QStringLiteral("Could not create the settings table."));
+}
+
+bool authenticateOrSetUp() {
+    QSqlQuery query;
+    query.prepare(QStringLiteral("SELECT value FROM settings WHERE key='password_salt'"));
+    if (!runQuery(query, QStringLiteral("Could not read login settings."))) return false;
+    const bool firstRun = !query.next();
+
+    QDialog dialog;
+    dialog.setWindowTitle(firstRun ? QStringLiteral("Create teacher login") : QStringLiteral("Teacher login"));
+    dialog.setModal(true);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout;
+    auto *password = new QLineEdit;
+    password->setEchoMode(QLineEdit::Password);
+    password->setPlaceholderText(firstRun ? QStringLiteral("Create a password") : QStringLiteral("Password"));
+    form->addRow(QStringLiteral("Password:"), password);
+    QLineEdit *confirm = nullptr;
+    if (firstRun) {
+        confirm = new QLineEdit;
+        confirm->setEchoMode(QLineEdit::Password);
+        confirm->setPlaceholderText(QStringLiteral("Enter it again"));
+        form->addRow(QStringLiteral("Confirm:"), confirm);
+        layout->addWidget(new QLabel(QStringLiteral("First run: set a teacher password for this computer.")));
     }
-    updateStatus();
-}
+    layout->addLayout(form);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
 
-bool saveAttendance() {
-    std::ofstream file(DATA_FILE, std::ios::binary | std::ios::trunc);
-    if (!file) return false;
-
-    file << "Name,Status\n";
-    for (const Student& student : students) {
-        file << toUtf8(student.name) << ',' << (student.present ? "Present" : "Absent") << '\n';
-    }
-    return static_cast<bool>(file);
-}
-
-void loadAttendance() {
-    std::ifstream file(DATA_FILE, std::ios::binary);
-    if (!file) return;
-
-    std::string line;
-    while (std::getline(file, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty() || line == "Name,Status") continue;
-
-        const std::size_t comma = line.rfind(',');
-        if (comma == std::string::npos) continue;
-        const std::string name = line.substr(0, comma);
-        if (name.empty()) continue;
-
-        Student student;
-        student.name = fromUtf8(name);
-        student.present = line.substr(comma + 1) == "Present";
-        students.push_back(student);
-    }
-}
-
-void showSaveError() {
-    MessageBoxW(mainWindow,
-        L"Could not save attendance.csv. Check that the application folder is writable.",
-        L"Save error", MB_OK | MB_ICONERROR);
-}
-
-void setAttendance(bool present) {
-    const LRESULT selection = SendMessageW(studentList, LB_GETCURSEL, 0, 0);
-    if (selection == LB_ERR) {
-        MessageBoxW(mainWindow, L"Select a student first.", L"No student selected", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
-    const int index = static_cast<int>(selection);
-    students[index].present = present;
-    refreshList(index);
-    if (!saveAttendance()) showSaveError();
-}
-
-void layoutControls(HWND window) {
-    RECT client;
-    GetClientRect(window, &client);
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-    const int margin = 16;
-    const int buttonWidth = 112;
-    const int gap = 8;
-
-    MoveWindow(nameEdit, margin, margin, width - margin * 3 - buttonWidth, 28, TRUE);
-    MoveWindow(GetDlgItem(window, ID_ADD_BUTTON), width - margin - buttonWidth, margin, buttonWidth, 28, TRUE);
-    MoveWindow(studentList, margin, margin + 40, width - margin * 2, height - 40 - 90, TRUE);
-
-    const int buttonY = height - 82;
-    MoveWindow(GetDlgItem(window, ID_PRESENT_BUTTON), margin, buttonY, buttonWidth, 30, TRUE);
-    MoveWindow(GetDlgItem(window, ID_ABSENT_BUTTON), margin + buttonWidth + gap, buttonY, buttonWidth, 30, TRUE);
-    MoveWindow(GetDlgItem(window, ID_SAVE_BUTTON), width - margin - buttonWidth, buttonY, buttonWidth, 30, TRUE);
-    MoveWindow(statusLabel, margin, height - 42, width - margin * 2, 24, TRUE);
-}
-
-LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    switch (message) {
-    case WM_CREATE: {
-        nameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0,
-            window, reinterpret_cast<HMENU>(ID_NAME_EDIT), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Add student",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
-            window, reinterpret_cast<HMENU>(ID_ADD_BUTTON), nullptr, nullptr);
-        studentList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_HASSTRINGS,
-            0, 0, 0, 0, window, reinterpret_cast<HMENU>(ID_LIST), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Mark present",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
-            window, reinterpret_cast<HMENU>(ID_PRESENT_BUTTON), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Mark absent",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
-            window, reinterpret_cast<HMENU>(ID_ABSENT_BUTTON), nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"Save now",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 0, 0,
-            window, reinterpret_cast<HMENU>(ID_SAVE_BUTTON), nullptr, nullptr);
-        statusLabel = CreateWindowW(L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0,
-            window, reinterpret_cast<HMENU>(ID_STATUS), nullptr, nullptr);
-
-        loadAttendance();
-        refreshList();
-        layoutControls(window);
-        return 0;
-    }
-    case WM_SIZE:
-        if (nameEdit && studentList && statusLabel) layoutControls(window);
-        return 0;
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case ID_ADD_BUTTON: {
-            const int length = GetWindowTextLengthW(nameEdit);
-            if (length <= 0) {
-                MessageBoxW(window, L"Type a student name first.", L"Name required", MB_OK | MB_ICONINFORMATION);
-                return 0;
-            }
-            std::wstring name(static_cast<std::size_t>(length) + 1, L'\0');
-            GetWindowTextW(nameEdit, &name[0], length + 1);
-            name.resize(static_cast<std::size_t>(length));
-            const std::size_t first = name.find_first_not_of(L" \t");
-            if (first == std::wstring::npos) {
-                MessageBoxW(window, L"Type a student name first.", L"Name required", MB_OK | MB_ICONINFORMATION);
-                return 0;
-            }
-            name = name.substr(first, name.find_last_not_of(L" \t") - first + 1);
-            if (name.find_first_of(L",\r\n") != std::wstring::npos) {
-                MessageBoxW(window, L"Student names cannot contain commas or line breaks.", L"Invalid name", MB_OK | MB_ICONWARNING);
-                return 0;
-            }
-            const bool alreadyExists = std::any_of(students.begin(), students.end(),
-                [&name](const Student& student) { return student.name == name; });
-            if (alreadyExists) {
-                MessageBoxW(window, L"That student is already on the list.", L"Duplicate student", MB_OK | MB_ICONINFORMATION);
-                return 0;
-            }
-            students.push_back({name, false});
-            SetWindowTextW(nameEdit, L"");
-            refreshList(static_cast<int>(students.size()) - 1);
-            if (!saveAttendance()) showSaveError();
-            SetFocus(nameEdit);
-            return 0;
+    for (;;) {
+        if (dialog.exec() != QDialog::Accepted) return false;
+        if (password->text().size() < 8) {
+            QMessageBox::warning(&dialog, QStringLiteral("Password too short"),
+                                 QStringLiteral("Use at least 8 characters."));
+            continue;
         }
-        case ID_PRESENT_BUTTON:
-            setAttendance(true);
-            return 0;
-        case ID_ABSENT_BUTTON:
-            setAttendance(false);
-            return 0;
-        case ID_SAVE_BUTTON:
-            if (saveAttendance()) {
-                MessageBoxW(window, L"Attendance saved to attendance.csv.", L"Saved", MB_OK | MB_ICONINFORMATION);
-            } else {
-                showSaveError();
-            }
-            return 0;
-        case ID_LIST:
-            if (HIWORD(wParam) == LBN_DBLCLK) setAttendance(true);
-            return 0;
+        if (firstRun && password->text() != confirm->text()) {
+            QMessageBox::warning(&dialog, QStringLiteral("Passwords do not match"),
+                                 QStringLiteral("Please enter the same password in both fields."));
+            continue;
         }
         break;
-    case WM_DESTROY:
-        if (!saveAttendance()) showSaveError();
-        PostQuitMessage(0);
-        return 0;
     }
-    return DefWindowProcW(window, message, wParam, lParam);
+
+    if (firstRun) {
+        const QByteArray salt = QCryptographicHash::hash(QByteArray::number(QDateTime::currentMSecsSinceEpoch()) +
+                                    QByteArray::number(QRandomGenerator::global()->generate64()),
+                                    QCryptographicHash::Sha256).toHex();
+        QSqlQuery insert;
+        insert.prepare(QStringLiteral("INSERT INTO settings(key,value) VALUES('password_salt',?),('password_hash',?)"));
+        insert.addBindValue(QString::fromLatin1(salt));
+        insert.addBindValue(hashPassword(password->text(), salt));
+        return runQuery(insert, QStringLiteral("Could not save teacher login."));
+    }
+
+    const QString saltText = query.value(0).toString();
+    QSqlQuery hashQuery;
+    hashQuery.prepare(QStringLiteral("SELECT value FROM settings WHERE key='password_hash'"));
+    if (!runQuery(hashQuery, QStringLiteral("Could not read teacher login.")) || !hashQuery.next()) return false;
+    if (hashPassword(password->text(), QByteArray::fromLatin1(saltText.toLatin1())) != hashQuery.value(0).toString()) {
+        QMessageBox::warning(nullptr, QStringLiteral("Login failed"), QStringLiteral("Incorrect password."));
+        return false;
+    }
+    return true;
 }
+
+QString csvField(QString value) {
+    value.replace('"', QStringLiteral("\"\""));
+    return QStringLiteral("\"") + value + QStringLiteral("\"");
+}
+
+class AttendanceWindow final : public QWidget {
+public:
+    AttendanceWindow() {
+        setWindowTitle(QStringLiteral("ClassCheck — Attendance"));
+        resize(820, 560);
+
+        auto *root = new QVBoxLayout(this);
+        auto *top = new QHBoxLayout;
+        top->addWidget(new QLabel(QStringLiteral("Attendance date:")));
+        date_ = new QDateEdit(QDate::currentDate());
+        date_->setCalendarPopup(true);
+        date_->setDisplayFormat(QStringLiteral("yyyy-MM-dd"));
+        top->addWidget(date_);
+        top->addStretch();
+        addButton_ = new QPushButton(QStringLiteral("Add student"));
+        removeButton_ = new QPushButton(QStringLiteral("Remove selected"));
+        exportButton_ = new QPushButton(QStringLiteral("Export date to CSV"));
+        top->addWidget(addButton_);
+        top->addWidget(removeButton_);
+        top->addWidget(exportButton_);
+        root->addLayout(top);
+
+        table_ = new QTableWidget(0, 3);
+        table_->setHorizontalHeaderLabels({QStringLiteral("Student ID"), QStringLiteral("Name"), QStringLiteral("Status")});
+        table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+        table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+        table_->setSelectionMode(QAbstractItemView::SingleSelection);
+        table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        root->addWidget(table_);
+
+        auto *bottom = new QHBoxLayout;
+        status_ = new QComboBox;
+        status_->addItems(statuses);
+        auto *markButton = new QPushButton(QStringLiteral("Set selected status"));
+        summary_ = new QLabel;
+        bottom->addWidget(new QLabel(QStringLiteral("Set status:")));
+        bottom->addWidget(status_);
+        bottom->addWidget(markButton);
+        bottom->addStretch();
+        bottom->addWidget(summary_);
+        root->addLayout(bottom);
+
+        connect(date_, &QDateEdit::dateChanged, this, [this] { reload(); });
+        connect(addButton_, &QPushButton::clicked, this, [this] { addStudent(); });
+        connect(removeButton_, &QPushButton::clicked, this, [this] { removeStudent(); });
+        connect(exportButton_, &QPushButton::clicked, this, [this] { exportCsv(); });
+        connect(markButton, &QPushButton::clicked, this, [this] { setSelectedStatus(); });
+        reload();
+    }
+
+private:
+    QDateEdit *date_ = nullptr;
+    QTableWidget *table_ = nullptr;
+    QComboBox *status_ = nullptr;
+    QLabel *summary_ = nullptr;
+    QPushButton *addButton_ = nullptr;
+    QPushButton *removeButton_ = nullptr;
+    QPushButton *exportButton_ = nullptr;
+
+    void reload() {
+        table_->setRowCount(0);
+        QSqlQuery query;
+        query.prepare(QStringLiteral("SELECT s.id,s.name,COALESCE(a.status,'Unmarked') "
+                                     "FROM students s LEFT JOIN attendance a "
+                                     "ON a.student_id=s.id AND a.date=? ORDER BY s.name COLLATE NOCASE"));
+        query.addBindValue(date_->date().toString(Qt::ISODate));
+        if (!runQuery(query, QStringLiteral("Could not load attendance."))) return;
+        int present = 0, absent = 0, late = 0, excused = 0, unmarked = 0;
+        while (query.next()) {
+            const int row = table_->rowCount();
+            table_->insertRow(row);
+            for (int column = 0; column < 3; ++column)
+                table_->setItem(row, column, new QTableWidgetItem(query.value(column).toString()));
+            const QString state = query.value(2).toString();
+            if (state == QStringLiteral("Present")) ++present;
+            else if (state == QStringLiteral("Absent")) ++absent;
+            else if (state == QStringLiteral("Late")) ++late;
+            else if (state == QStringLiteral("Excused")) ++excused;
+            else ++unmarked;
+        }
+        summary_->setText(QStringLiteral("Present %1 | Absent %2 | Late %3 | Excused %4 | Unmarked %5")
+                          .arg(present).arg(absent).arg(late).arg(excused).arg(unmarked));
+    }
+
+    void addStudent() {
+        bool ok = false;
+        const QString id = QInputDialog::getText(this, QStringLiteral("Add student"),
+                            QStringLiteral("Student ID:"), QLineEdit::Normal, QString(), &ok).trimmed();
+        if (!ok) return;
+        if (id.isEmpty() || id.contains(',') || id.contains('\n')) {
+            QMessageBox::warning(this, QStringLiteral("Invalid ID"), QStringLiteral("Enter a non-empty ID without commas or line breaks."));
+            return;
+        }
+        const QString name = QInputDialog::getText(this, QStringLiteral("Add student"),
+                              QStringLiteral("Student name:"), QLineEdit::Normal, QString(), &ok).trimmed();
+        if (!ok) return;
+        if (name.isEmpty() || name.contains(',') || name.contains('\n')) {
+            QMessageBox::warning(this, QStringLiteral("Invalid name"), QStringLiteral("Enter a non-empty name without commas or line breaks."));
+            return;
+        }
+        QSqlQuery query;
+        query.prepare(QStringLiteral("INSERT INTO students(id,name) VALUES(?,?)"));
+        query.addBindValue(id);
+        query.addBindValue(name);
+        if (!query.exec()) {
+            QMessageBox::warning(this, QStringLiteral("Could not add student"),
+                                 QStringLiteral("That student ID may already exist.\n\n") + query.lastError().text());
+            return;
+        }
+        reload();
+    }
+
+    void removeStudent() {
+        const int row = table_->currentRow();
+        if (row < 0) {
+            QMessageBox::information(this, QStringLiteral("Select a student"), QStringLiteral("Select a student to remove."));
+            return;
+        }
+        const QString id = table_->item(row, 0)->text();
+        if (QMessageBox::question(this, QStringLiteral("Remove student"),
+            QStringLiteral("Remove student %1 and all their attendance records?").arg(id)) != QMessageBox::Yes) return;
+        QSqlQuery query;
+        query.prepare(QStringLiteral("DELETE FROM attendance WHERE student_id=?"));
+        query.addBindValue(id);
+        if (!runQuery(query, QStringLiteral("Could not remove attendance records."))) return;
+        query.prepare(QStringLiteral("DELETE FROM students WHERE id=?"));
+        query.addBindValue(id);
+        if (runQuery(query, QStringLiteral("Could not remove student."))) reload();
+    }
+
+    void setSelectedStatus() {
+        const int row = table_->currentRow();
+        if (row < 0) {
+            QMessageBox::information(this, QStringLiteral("Select a student"), QStringLiteral("Select a student first."));
+            return;
+        }
+        QSqlQuery query;
+        query.prepare(QStringLiteral("INSERT INTO attendance(student_id,date,status) VALUES(?,?,?) "
+                                     "ON CONFLICT(student_id,date) DO UPDATE SET status=excluded.status"));
+        query.addBindValue(table_->item(row, 0)->text());
+        query.addBindValue(date_->date().toString(Qt::ISODate));
+        query.addBindValue(status_->currentText());
+        if (runQuery(query, QStringLiteral("Could not save attendance."))) reload();
+    }
+
+    void exportCsv() {
+        const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export attendance"),
+            QStringLiteral("attendance-%1.csv").arg(date_->date().toString(Qt::ISODate)), QStringLiteral("CSV files (*.csv)"));
+        if (path.isEmpty()) return;
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::critical(this, QStringLiteral("Export error"), file.errorString());
+            return;
+        }
+        QTextStream out(&file);
+        out << "Date,Student ID,Name,Status\n";
+        for (int row = 0; row < table_->rowCount(); ++row)
+            out << csvField(date_->date().toString(Qt::ISODate)) << ','
+                << csvField(table_->item(row, 0)->text()) << ','
+                << csvField(table_->item(row, 1)->text()) << ','
+                << csvField(table_->item(row, 2)->text()) << '\n';
+        QMessageBox::information(this, QStringLiteral("Export complete"), QStringLiteral("CSV report saved."));
+    }
+};
 
 } // namespace
 
-int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand) {
-    WNDCLASSEXW windowClass = {};
-    windowClass.cbSize = sizeof(windowClass);
-    windowClass.lpfnWndProc = windowProcedure;
-    windowClass.hInstance = instance;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    windowClass.lpszClassName = WINDOW_CLASS;
-
-    if (!RegisterClassExW(&windowClass)) {
-        MessageBoxW(nullptr, L"Could not register the application window.", L"Startup error", MB_OK | MB_ICONERROR);
-        return 1;
-    }
-
-    mainWindow = CreateWindowExW(0, WINDOW_CLASS, L"Simple Attendance Checker",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 620, 460,
-        nullptr, nullptr, instance, nullptr);
-    if (!mainWindow) {
-        MessageBoxW(nullptr, L"Could not create the application window.", L"Startup error", MB_OK | MB_ICONERROR);
-        return 1;
-    }
-
-    ShowWindow(mainWindow, showCommand);
-    UpdateWindow(mainWindow);
-
-    MSG message;
-    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-    }
-    return static_cast<int>(message.wParam);
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+    QApplication::setApplicationName(QStringLiteral("ClassCheck"));
+    QApplication::setOrganizationName(QStringLiteral("ClassCheck"));
+    if (!openDatabase() || !authenticateOrSetUp()) return 0;
+    AttendanceWindow window;
+    window.show();
+    return app.exec();
 }
